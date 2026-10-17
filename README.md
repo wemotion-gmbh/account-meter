@@ -88,8 +88,10 @@ first sending. The session is never disturbed: no toast, no status line, no mode
 ## Box mode
 
 In the box image the plugin is copied to `/opt/claude-box/plugin/` and loaded by
-`~/.claude/settings.json` `{"env": {"CLAUDE_CODE_PLUGIN_DIRS": "/opt/claude-box/plugin"}}` (the
-marketplace copy must be turned off there by managed settings, or it would run twice). Every `ACCOUNT_METER_INTERVAL_S` seconds
+`~/.claude/settings.json` `{"env": {"CLAUDE_CODE_PLUGIN_DIRS": "/opt/claude-box/plugin"}}`. The boxes
+have no marketplace and no org-synced copy (no `~/.claude/plugins` there, checked 17.10.); should one
+ever appear, it would run as a reporter beside the box meter and only count turns, which the box does
+not run. Every `ACCOUNT_METER_INTERVAL_S` seconds
 (60..3600, default 300; after a start with a random 0..60 s offset) a short-lived child
 `claude -p --input-format stream-json ... --setting-sources ''` answers the SDK control request
 `get_usage` (no model request; the debug log is checked for `/v1/messages`). A new login, refresh or
