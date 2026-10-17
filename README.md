@@ -11,6 +11,20 @@ overview of its Claude accounts. One plugin, two modes, chosen by where it runs:
 `/account-meter status` shows the mode, the account, the last report, the last answer and what is
 still waiting.
 
+## Install
+
+Accounts in the wemotion organisation get it with the marketplace (claude.ai org sync, auto install).
+Anyone else with access to the private marketplace repo (also on a private Claude account, and in
+every config folder you use with `CLAUDE_CONFIG_DIR`):
+
+```
+/plugin install account-meter --marketplace wemotion-gmbh/claude-plugins
+```
+
+Installed twice (a local copy beside the org sync is fine: Claude Code then runs only the local
+one; two local copies both run), it still counts once: both copies send the same ranges of the same
+session, and the app books each range once.
+
 ## Reporter mode
 
 **Which account.** `oauthAccount.accountUuid` from `$CLAUDE_CONFIG_DIR/.claude.json`, else
@@ -24,18 +38,26 @@ other prices), as the growth per session in this process:
 - the base is the sum at the session's first turn in this process (a resumed or forked session
   brings its old sum, which is never reported again);
 - growth counts after each of its own turns, for the account at that turn's start;
-- a new session id (`/clear`, `/resume`) or a falling sum starts a new base: jumps never count;
+- a new session id (`/clear`, `/resume`) or a falling sum starts a new base: jumps never count
+  (after a fall the session gets a new key, see `session` below);
 - at the end of the process one last reading (a `/compact` after the last turn) is sent at once.
 
 **What is sent**, at most once a minute per account, bundled:
 
 ```json
-{"schema":1,"process":"a1b2c3d4e5f60718","claude_version":"2.1.302",
- "items":[{"seq":7,"cost_delta_usd":0.4213,"check":{"five_hour_resets_at":1792231200,"seven_day_resets_at":1792656000}}]}
+{"schema":2,"process":"a1b2c3d4e5f60718","claude_version":"2.1.302",
+ "items":[{"seq":7,"session":"9f2c4e1a0b3d5f68","from_usd":3.2,"to_usd":3.6213,
+           "check":{"five_hour_resets_at":1792231200,"seven_day_resets_at":1792656000}}]}
 ```
 
 - `process`: random per plugin start, `seq`: rising per process (the app counts each once);
-- `cost_delta_usd`: the cost growth, at most 25 per item;
+- `session`: first 16 hex of `sha256("account-meter:" + session id + ":" + epoch)`, `epoch` = falls
+  of the sum seen in this process (normally 0); nothing about the session can be read from it;
+- `from_usd`, `to_usd`: the stretch of the session's running sum this item covers (micro dollar
+  precision, at most 25 per item). The app books only what of a range is not booked yet for that
+  session, so a second copy of the plugin, or any repeat, counts nothing. Known limit: the same
+  session open in two processes at once (`--resume` twice) starts both at the same sum, and that
+  overlap counts once ("rather too little than twice");
 - `check`: the reset times of the turn's rate limits, only to cross-check against the box
   measurement of that account (a wrong account is refused), never shown.
 
@@ -51,7 +73,8 @@ receipt settles items.
 - the account UUID never goes over the wire: `X-Report-Key` = first 16 hex of
   `sha256("claude-accounts:" + uuid)`, `X-Report-Signature` = `HMAC-SHA256(uuid, time + "\n" + body)`,
   `X-Report-Time` within ±5 min;
-- the app takes reports only for accounts it knows, drops repeats of (`process`, `seq`), cross-checks
+- the app takes reports only for accounts it knows, drops repeats of (`process`, `seq`) and of
+  session ranges, cross-checks
   the reset times against its own box measurement and caps the amounts (budget);
 - the UUID is no password: at worst the cost statistics are wrong. It gives no access to accounts,
   boxes or credentials.

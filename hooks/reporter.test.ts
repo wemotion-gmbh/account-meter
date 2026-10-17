@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { hmacSha256Hex } from './crypto'
-import { checkFrom, classify, homeFromRoot, MAX_ITEMS, normalizeUuid, REPORT_URL, reportKey } from './reporter'
+import { checkFrom, classify, homeFromRoot, MAX_ITEMS, normalizeUuid, REPORT_URL, reportKey, sessionKey } from './reporter'
 
 const T0 = Date.parse('2026-10-17T08:00:00Z')
 const MIN = 60_000
@@ -78,7 +78,8 @@ describe('answers (CONTRACT-2.md table)', () => {
 
 type Init = { method?: string; headers?: Record<string, string>; body?: string; [k: string]: unknown }
 type Post = { url: string; init: Init }
-type SentItem = { seq: number; cost_delta_usd: number; check?: Record<string, number> }
+type SentItem = { seq: number; session: string; from_usd: number; to_usd: number; check?: Record<string, number> }
+const amount = (i: SentItem) => Math.round((i.to_usd - i.from_usd) * 1e6) / 1e6
 type Body = { schema: number; process: string; claude_version: string; items: SentItem[] }
 type Reply = { status: number; text?: string } | 'throw' | 'timeout'
 
@@ -181,7 +182,7 @@ const sent = (w: World) => bodies(w).flatMap(b => b.items)
 // What the app booked: items answered ok, each seq once.
 function booked(w: World): number {
   const seen = new Map<number, number>()
-  for (const i of sent(w)) seen.set(i.seq, i.cost_delta_usd)
+  for (const i of sent(w)) seen.set(i.seq, amount(i))
   return Math.round([...seen.values()].reduce((s, x) => s + x, 0) * 1e6) / 1e6
 }
 
@@ -213,11 +214,14 @@ describe('reporter', () => {
       'X-Report-Time': time,
       'X-Report-Signature': hmacSha256Hex(A, `${time}\n${body}`),
     })
-    expect(body.startsWith('{"schema":1,"process":"')).toBe(true)
+    expect(body.startsWith('{"schema":2,"process":"')).toBe(true)
     const b = JSON.parse(body) as Body
     expect(b.process).toMatch(/^[0-9a-f]{16}$/)
     expect(b.claude_version).toBe('2.1.302')
-    expect(b.items).toEqual([{ seq: 1, cost_delta_usd: 0.4213, check: { five_hour_resets_at: sec(FIVE), seven_day_resets_at: sec(SEVEN) } }])
+    expect(b.items).toEqual([{
+      seq: 1, session: sessionKey('s1', 0), from_usd: 0, to_usd: 0.4213,
+      check: { five_hour_resets_at: sec(FIVE), seven_day_resets_at: sec(SEVEN) },
+    }])
     // the uuid itself never goes over the wire
     expect(JSON.stringify(p)).not.toContain(A)
     await clock.advance(5 * MIN)
@@ -235,7 +239,7 @@ describe('reporter', () => {
     await turn($, w, 0.5)
     await clock.advance(40_000)
     expect(w.posts.length).toBe(1)
-    expect(sent(w)).toEqual([expect.objectContaining({ seq: 1, cost_delta_usd: 0.5 })])
+    expect(sent(w)).toEqual([expect.objectContaining({ seq: 1, from_usd: 0, to_usd: 0.5 })])
   })
 
   test('resume: the old sum of the session is the base, only new turns count', async ($, on) => {
@@ -274,7 +278,7 @@ describe('reporter', () => {
     await clock.advance(MIN)
     expect(w.posts.length).toBe(1)
     expect(booked(w)).toBe(1.5)
-    expect(sent(w).every(i => i.cost_delta_usd > 0)).toBe(true)
+    expect(sent(w).every(i => amount(i) > 0)).toBe(true)
   })
 
   test('/resume in the process: the jump to the other session\'s sum is not counted', async ($, on) => {
@@ -331,6 +335,29 @@ describe('reporter', () => {
     await turn($, w, 1.8)
     await clock.advance(MIN)
     expect(booked(w)).toBe(2.5)
+    // after the fall the session gets a new key, so its ranges cannot land on 0..2
+    expect(sent(w).map(i => [i.session, i.from_usd, i.to_usd])).toEqual([
+      [sessionKey('s1', 0), 0, 2],
+      [sessionKey('s1', 1), 1.3, 1.8],
+    ])
+  })
+
+  test('the ranges of a session touch, however the turns fall into requests', async ($, on) => {
+    const w = world(on)
+    login(w, A)
+    const clock = mock.clock(on, { now: T0 })
+    await start($)
+    await turn($, w, 0.1)
+    await turn($, w, 0.30000000000000004) // 0.1 + 0.2 in floating point
+    await clock.advance(MIN)
+    await turn($, w, 0.7)
+    await clock.advance(MIN)
+    await turn($, w, 0.7000004)
+    await turn($, w, 1)
+    await clock.advance(MIN)
+    const ranges = sent(w).map(i => [i.from_usd, i.to_usd])
+    expect(ranges).toEqual([[0, 0.3], [0.3, 0.7], [0.7, 1]])
+    expect(new Set(sent(w).map(i => i.session))).toEqual(new Set([sessionKey('s1', 0)]))
   })
 
   test('a subagent\'s turn and a turn without its own turn.start count nothing on their own', async ($, on) => {
@@ -362,7 +389,7 @@ describe('reporter', () => {
     await clock.advance(MIN)
     expect(w.posts.length).toBe(2)
     expect(w.posts.map(p => p.init.headers?.['X-Report-Key'])).toEqual([reportKey(A), reportKey(B)])
-    expect(bodies(w).map(b => b.items.map(i => [i.seq, i.cost_delta_usd]))).toEqual([[[1, 1.5]], [[2, 0.75]]])
+    expect(bodies(w).map(b => b.items.map(i => [i.seq, amount(i)]))).toEqual([[[1, 1.5]], [[2, 0.75]]])
     expect(booked(w)).toBe(2.25) // nothing twice
   })
 
@@ -416,8 +443,8 @@ describe('reporter', () => {
     await turn($, w, 2, { usage: false }) // an API error: the limits are an older response's
     await clock.advance(MIN)
     expect(sent(w)).toEqual([
-      { seq: 1, cost_delta_usd: 1, check: { five_hour_resets_at: sec(FIVE) } },
-      { seq: 2, cost_delta_usd: 1 },
+      { seq: 1, session: sessionKey('s1', 0), from_usd: 0, to_usd: 1, check: { five_hour_resets_at: sec(FIVE) } },
+      { seq: 2, session: sessionKey('s1', 0), from_usd: 1, to_usd: 2 },
     ])
   })
 
@@ -435,7 +462,7 @@ describe('reporter', () => {
     const [first, second] = bodies(w)
     expect(second!.items.length).toBe(2)
     expect(JSON.stringify(second!.items[0])).toBe(JSON.stringify(first!.items[0]))
-    expect(second!.items[1]).toEqual(expect.objectContaining({ seq: 2, cost_delta_usd: 0.7 }))
+    expect(second!.items[1]).toEqual(expect.objectContaining({ seq: 2, from_usd: 1, to_usd: 1.7 }))
     expect(w.posts[0]!.init.headers?.['X-Report-Time']).not.toBe(w.posts[1]!.init.headers?.['X-Report-Time'])
     await clock.advance(MIN)
     expect(w.posts.length).toBe(2) // both settled
@@ -524,7 +551,7 @@ describe('reporter', () => {
     expect(w.posts.length).toBe(1)
     await clock.advance(2 * MIN)
     expect(w.posts.length).toBe(2)
-    expect(bodies(w)[1]!.items.map(i => [i.seq, i.cost_delta_usd])).toEqual([[1, 1], [2, 0.5]])
+    expect(bodies(w)[1]!.items.map(i => [i.seq, amount(i)])).toEqual([[1, 1], [2, 0.5]])
   })
 
   test('422 mismatch silences that account for the process; another account goes on', async ($, on) => {
@@ -543,7 +570,7 @@ describe('reporter', () => {
     await clock.advance(MIN)
     expect(w.posts.length).toBe(2)
     expect(w.posts[1]!.init.headers?.['X-Report-Key']).toBe(reportKey(B))
-    expect(bodies(w)[1]!.items.map(i => i.cost_delta_usd)).toEqual([0.5])
+    expect(bodies(w)[1]!.items.map(i => amount(i))).toEqual([0.5])
     const st = await $.command.run({ command: 'account-meter', args: 'status' } as never)
     expect(st.text).toMatch(/a@example\.test: silent in this process \(mismatch\)/)
   })
@@ -586,8 +613,8 @@ describe('reporter', () => {
     for (let i = 0; i < 3; i++) await clock.advance(MIN)
     const amounts = new Map<number, number>()
     for (const it of sent(w)) {
-      if (amounts.has(it.seq)) expect(it.cost_delta_usd).toBe(amounts.get(it.seq)!) // never changed
-      amounts.set(it.seq, it.cost_delta_usd)
+      if (amounts.has(it.seq)) expect(amount(it)).toBe(amounts.get(it.seq)!) // never changed
+      amounts.set(it.seq, amount(it))
     }
     expect(booked(w)).toBe(0.4)
     expect([...amounts.keys()]).toEqual([...amounts.keys()].sort((a, b) => a - b))
@@ -601,7 +628,7 @@ describe('reporter', () => {
     await start($)
     await turn($, w, 60)
     await clock.advance(MIN)
-    expect(sent(w).map(i => i.cost_delta_usd)).toEqual([25, 25, 10])
+    expect(sent(w).map(i => amount(i))).toEqual([25, 25, 10])
   })
 
   test('the end of the process: one last reading, sent at once', async ($, on) => {
@@ -614,7 +641,7 @@ describe('reporter', () => {
     w.cost = 1.3 // a /compact or a background agent after the last turn
     await $.session.end(end('prompt_input_exit'))
     expect(w.posts.length).toBe(2)
-    expect(bodies(w)[1]!.items.map(i => i.cost_delta_usd)).toEqual([0.3])
+    expect(bodies(w)[1]!.items.map(i => amount(i))).toEqual([0.3])
   })
 
   test('a session that ran no turn in this process reports nothing, even at its end', async ($, on) => {
