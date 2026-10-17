@@ -13,6 +13,10 @@ const FIVE = '2026-10-17T10:00:00Z' // ahead of T0
 const SEVEN = '2026-10-20T00:00:00Z'
 const sec = (iso: string) => Date.parse(iso) / 1000
 const USAGE = { inputTokens: 10, outputTokens: 5, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, model: 'claude-test' }
+// Tests that simulate ten minutes or more get a longer limit than the kit's
+// 5 s: every simulated second runs the plugin's 1-s watch, and on a busy CI
+// builder an hour of it took up to 5 s (17.10., box image smoke stage).
+const LONG = { timeoutMs: 30_000 }
 
 // ---- pure parts ----
 
@@ -664,7 +668,7 @@ describe('reporter', () => {
     expect(booked(w)).toBe(4)
   })
 
-  test('422 unknown_account rests the account for an hour and keeps its items', async ($, on) => {
+  test('422 unknown_account rests the account for an hour and keeps its items', LONG, async ($, on) => {
     const w = world(on)
     login(w, A)
     const clock = mock.clock(on, { now: T0 })
@@ -680,7 +684,7 @@ describe('reporter', () => {
     expect(bodies(w)[1]!.items.map(i => [i.seq, amount(i)])).toEqual([[1, 1], [2, 0.5]])
   })
 
-  test('422 mismatch drops that account\'s items and silences it for an hour; another account goes on', async ($, on) => {
+  test('422 mismatch drops that account\'s items and silences it for an hour; another account goes on', LONG, async ($, on) => {
     const w = world(on)
     login(w, A)
     const clock = mock.clock(on, { now: T0 })
@@ -708,7 +712,7 @@ describe('reporter', () => {
     expect((JSON.parse(w.posts.at(-1)!.init.body!) as Body).items.map(i => amount(i))).toEqual([0.25])
   })
 
-  test('429, 3xx, 404, 503 unavailable, 5xx, non-JSON, network errors and timeouts keep the items for the next round', async ($, on) => {
+  test('429, 3xx, 404, 503 unavailable, 5xx, non-JSON, network errors and timeouts keep the items for the next round', LONG, async ($, on) => {
     const w = world(on)
     login(w, A)
     const clock = mock.clock(on, { now: T0 })
@@ -730,7 +734,7 @@ describe('reporter', () => {
     expect(new Set(w.posts.map(p => JSON.stringify((JSON.parse(p.init.body!) as Body).items))).size).toBe(1)
   })
 
-  test('offline: a long outage holds at most 20 items, and all the cost arrives afterwards', async ($, on) => {
+  test('offline: a long outage holds at most 20 items, and all the cost arrives afterwards', LONG, async ($, on) => {
     const w = world(on)
     login(w, A)
     const clock = mock.clock(on, { now: T0 })

@@ -115,6 +115,10 @@ claude plugin validate .
 
 Try it on a machine: `claude --plugin-dir <this folder>`, then `/account-meter status`.
 
+A test that simulates ten minutes or more passes `LONG` (`{ timeoutMs: 30_000 }`) as its second
+argument: every simulated second runs the 1-s watch, which on a busy CI builder outlasts the kit's
+default limit of 5 s.
+
 ## Release
 
 Only from `main` after green CI (`.github/workflows/test.yml`): raise `version` in

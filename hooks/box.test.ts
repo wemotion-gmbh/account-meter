@@ -34,6 +34,10 @@ const FAILED_FETCH = answer(null)
 const ERROR_RESPONSE = JSON.stringify({ type: 'control_response', response: { subtype: 'error', request_id: 'meter-1', error: 'Unknown subtype' } }) + '\n'
 
 const CTX = { now: '2026-10-16T10:25:00Z', version: '2.1.301', accountUuid: null, email: null, modelRequests: 0 }
+// Tests that simulate ten minutes or more get a longer limit than the kit's
+// 5 s: every simulated second runs the plugin's 1-s watch, and on a busy CI
+// builder an hour of it took up to 5 s (17.10., box image smoke stage).
+const LONG = { timeoutMs: 30_000 }
 
 describe('parser', () => {
   test('fresh answer', () => {
@@ -270,7 +274,7 @@ describe('plugin', () => {
     expect(usageOf(w).model_requests).toBe(2)
   })
 
-  test('child failure: error state, then backoff doubles the wait', async ($, on) => {
+  test('child failure: error state, then backoff doubles the wait', LONG, async ($, on) => {
     const w = world(on, { fail: true })
     const clock = mock.clock(on, { now: 0 })
     await start($)
@@ -450,7 +454,7 @@ describe('plugin', () => {
     expect(usageOf(w).state).toBe('login_required')
   })
 
-  test('/clear and an in-process resume keep the meter running (no session.start follows)', async ($, on) => {
+  test('/clear and an in-process resume keep the meter running (no session.start follows)', LONG, async ($, on) => {
     const w = world(on)
     const clock = mock.clock(on, { now: 0 })
     await start($)
@@ -464,7 +468,7 @@ describe('plugin', () => {
     expect(childRuns(w)).toBe(3)
   })
 
-  test('the end of the process stops the meter', async ($, on) => {
+  test('the end of the process stops the meter', LONG, async ($, on) => {
     const w = world(on)
     const clock = mock.clock(on, { now: 0 })
     await start($)
@@ -484,7 +488,7 @@ describe('plugin', () => {
     expect(r.text).toMatch(/2026-10-16T10:25:10Z, 5h 74% 7d 54% \(a@example\.test\)/)
   })
 
-  test('outside the box folder the box meter never starts', async ($, on) => {
+  test('outside the box folder the box meter never starts', LONG, async ($, on) => {
     const w = world(on, { elsewhere: true })
     const clock = mock.clock(on, { now: 0 })
     await start($)
