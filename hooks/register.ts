@@ -6,7 +6,9 @@
 // /account-meter status shows what it does in this process.
 import type { EngineInterface, Register } from 'claude-code'
 import { boxEnd, boxStart, boxStatus, newBox } from './box'
-import { newReporter, reporterEnd, reporterStart, reporterStatus, reporterTurnComplete, reporterTurnStart } from './reporter'
+import {
+  newReporter, reporterBeforeLogin, reporterEnd, reporterStart, reporterStatus, reporterTurnComplete, reporterTurnStart,
+} from './reporter'
 
 export const BOX_ROOT = '/opt/claude-box/plugin'
 export type Mode = 'box' | 'reporter'
@@ -65,6 +67,14 @@ export const register: Register = on => {
     else await reporterEnd($, report, e, () => next.budget.remainingMs)
     return next(e)
   })
+
+  // Before the account changes: what grew since the last turn is the old one's.
+  for (const command of ['login', 'logout']) {
+    on('command.run', { command }, async ($, e, next) => {
+      if ((await (mode ??= modeOf($))) === 'reporter') await reporterBeforeLogin($, report)
+      return next(e)
+    })
+  }
 
   on('command.run', { command: 'account-meter' }, async ($, e) => {
     const arg = e.args.trim().toLowerCase()

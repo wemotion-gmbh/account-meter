@@ -21,6 +21,10 @@ const MAX_BODY_BYTES = 8192
 // What session.end's short bound keeps for the engine's own end step.
 const END_RESERVE_MS = 250
 const MAX_OPEN_TURNS = 64
+// How long a hook waits for the reporter: a reading outside a turn's end,
+// and a turn's own start and end.
+const CHECKPOINT_MS = 2_000
+const HOOK_MS = 5_000
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 export type Identity = { uuid: string; key: string; email: string | null }
@@ -207,10 +211,14 @@ export type Reporter = {
   stamp: string | null
   current: Identity | null
   fileNote: string
-  // The session whose cost this process follows: the last sum seen, who
-  // worked at its latest turn.start, and its key for the app.
+  // The session whose cost this process follows: the last sum seen and its
+  // key for the app.
   tracked: Tracked | null
   turns: Map<string, Identity | null>
+  // The main-loop turn running now (from its turn.start to its turn.complete).
+  openTurn: string | null
+  // Readings one at a time: one that overtook another would look like a fall.
+  chain: Promise<unknown>
   accounts: Map<string, Account>
   timer: { cancel: () => void } | null
   inflight: Promise<void> | null
@@ -220,10 +228,9 @@ export type Reporter = {
   logged: Set<string>
 }
 
-type Tracked = { sid: string; last: number; who: Identity | null; epoch: number; key: string }
+type Tracked = { sid: string; last: number; epoch: number; key: string }
 
-const track = (sid: string, last: number, who: Identity | null): Tracked =>
-  ({ sid, last, who, epoch: 0, key: sessionKey(sid, 0) })
+const track = (sid: string, last: number): Tracked => ({ sid, last, epoch: 0, key: sessionKey(sid, 0) })
 
 // The sum is now `usd`: the span since the last reading, or null when it did
 // not grow (a fall starts a new epoch from the new sum).
@@ -241,9 +248,21 @@ export function newReporter(): Reporter {
   return {
     processId: randomHex(8), seq: 0, version: 'unknown',
     file: undefined, stamp: null, current: null, fileNote: 'not read yet',
-    tracked: null, turns: new Map(), accounts: new Map(),
+    tracked: null, turns: new Map(), openTurn: null, chain: Promise.resolve(), accounts: new Map(),
     timer: null, inflight: null, lastReport: null, lastAnswer: null, clockHint: false, logged: new Set(),
   }
+}
+
+function serial<T>(r: Reporter, fn: () => Promise<T>): Promise<T> {
+  const run = r.chain.then(fn, fn)
+  r.chain = run.catch(() => undefined)
+  return run
+}
+
+// A hook waits for its reading at most `ms`; a reading that hangs stalls only
+// the reporter, never the session.
+function guarded($: EngineInterface, r: Reporter, fn: () => Promise<void>, ms = CHECKPOINT_MS): Promise<void> {
+  return within($, serial(r, fn), ms).then(() => undefined, () => undefined)
 }
 
 function logOnce($: EngineInterface, r: Reporter, key: string, text: string): void {
@@ -319,6 +338,22 @@ function book(r: Reporter, who: Identity, key: string, span: { from: number; to:
   if (last && last.session === key && last.to === span.from) last.to = span.to
   else acc.draft.push({ session: key, from: span.from, to: span.to })
   if (check) acc.check = check
+}
+
+// What the session cost since the last reading, outside a turn's own end: a
+// background agent, a /compact, the minute tick, the moment before /login.
+// It belongs to the account of the main-loop turn running now, else to the
+// account logged in now (before /login: still the old one). Callers hold the
+// chain.
+async function checkpointNow($: EngineInterface, r: Reporter): Promise<void> {
+  const t = r.tracked
+  if (!t || (await $.session.id()) !== t.sid) return
+  const { usd } = await reading($)
+  if (usd === null || r.tracked !== t) return
+  const span = advance(t, usd)
+  if (!span) return
+  const who = r.openTurn !== null ? (r.turns.get(r.openTurn) ?? null) : await identity($, r)
+  if (who) book(r, who, t.key, span, undefined)
 }
 
 const drafted = (acc: Account) => acc.draft.reduce((sum, s) => sum + (round6(s.to) - round6(s.from)), 0)
@@ -439,34 +474,58 @@ export async function reporterStart($: EngineInterface, r: Reporter): Promise<vo
     // keep unknown
   }
   r.timer?.cancel()
-  r.timer = $.clock.every(SEND_EVERY_MS, () => void flush($, r))
+  r.timer = $.clock.every(SEND_EVERY_MS, () => void tick($, r))
 }
 
-export async function reporterTurnStart($: EngineInterface, r: Reporter, e: TurnStartInput): Promise<void> {
+// Every minute: what grew meanwhile (a background agent while nobody types),
+// then a round.
+async function tick($: EngineInterface, r: Reporter): Promise<void> {
+  await guarded($, r, () => checkpointNow($, r))
+  await flush($, r)
+}
+
+// Right before /login or /logout: what grew since the last reading still
+// counts for the account logged in now, and goes out at once (not awaited,
+// the command runs on).
+export async function reporterBeforeLogin($: EngineInterface, r: Reporter): Promise<void> {
+  await guarded($, r, () => checkpointNow($, r))
+  void flush($, r)
+}
+
+export function reporterTurnStart($: EngineInterface, r: Reporter, e: TurnStartInput): Promise<void> {
+  return guarded($, r, () => turnStart($, r, e), HOOK_MS)
+}
+
+async function turnStart($: EngineInterface, r: Reporter, e: TurnStartInput): Promise<void> {
   try {
     const who = await identity($, r)
     r.turns.set(e.turnId, who)
+    r.openTurn = e.turnId
     if (r.turns.size > MAX_OPEN_TURNS) r.turns.delete(r.turns.keys().next().value!)
     const sid = await $.session.id()
-    if (r.tracked && r.tracked.sid === sid) {
-      r.tracked.who = who
-      return
-    }
+    if (r.tracked && r.tracked.sid === sid) return
     // The first turn of this session in this process: what it cost so far
     // (a resumed or forked session brings its old sum) is the base.
     const { usd } = await reading($)
-    r.tracked = usd === null ? null : track(sid, usd, who)
+    r.tracked = usd === null ? null : track(sid, usd)
   } catch {
     // never disturb the session
   }
 }
 
-export async function reporterTurnComplete($: EngineInterface, r: Reporter, e: TurnCompleteInput): Promise<void> {
-  if (e.agentId) return // a subagent's run: its cost is in the main loop's sum
+export function reporterTurnComplete($: EngineInterface, r: Reporter, e: TurnCompleteInput): Promise<void> {
+  // A subagent's run (also one in the background, after the main turn): its
+  // cost is in the session's sum, read now.
+  if (e.agentId) return guarded($, r, () => checkpointNow($, r))
+  return guarded($, r, () => turnComplete($, r, e), HOOK_MS)
+}
+
+async function turnComplete($: EngineInterface, r: Reporter, e: TurnCompleteInput): Promise<void> {
   try {
     const known = r.turns.has(e.turnId)
     const who = r.turns.get(e.turnId) ?? null
     r.turns.delete(e.turnId)
+    if (r.openTurn === e.turnId) r.openTurn = null
     const sid = await $.session.id()
     const now = await reading($)
     if (now.usd === null) {
@@ -474,7 +533,7 @@ export async function reporterTurnComplete($: EngineInterface, r: Reporter, e: T
       return
     }
     if (!r.tracked || r.tracked.sid !== sid) {
-      r.tracked = track(sid, now.usd, who)
+      r.tracked = track(sid, now.usd)
       return
     }
     const span = advance(r.tracked, now.usd)
@@ -493,11 +552,8 @@ export async function reporterEnd(
   $: EngineInterface, r: Reporter, e: SessionEndInput, remainingMs: () => number,
 ): Promise<void> {
   try {
-    const t = r.tracked
-    if (t && t.sid === e.sessionId && (await $.session.id()) === e.sessionId) {
-      const { usd } = await reading($)
-      const span = usd === null ? null : advance(t, usd)
-      if (span && t.who) book(r, t.who, t.key, span, undefined)
+    if (r.tracked?.sid === e.sessionId) {
+      await guarded($, r, () => checkpointNow($, r), Math.min(CHECKPOINT_MS, remainingMs() - END_RESERVE_MS))
     }
     if (e.reason === 'clear' || e.reason === 'resume') {
       // The process goes on under another session: the next round sends.

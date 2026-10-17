@@ -103,6 +103,9 @@ function world(on: On, o: { env?: Record<string, string> } = {}) {
     logs: [] as { text: string; to: string }[],
     toasts: 0,
     statuses: 0,
+    // what a core command (/login) does when it runs
+    commands: [] as string[],
+    onCommand: (_name: string) => {},
   }
   const env = o.env ?? { CLAUDE_CONFIG_DIR: '/cfg' }
   on('env.get', (_$, e) => {
@@ -117,6 +120,11 @@ function world(on: On, o: { env?: Record<string, string> } = {}) {
   on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: w.rate, cost: { usd: w.cost } } }) as never)
   on('session.version', () => ({ value: { version: '2.1.302' } }) as never)
   on('command.register', () => ({ value: { command: 'account-meter' } }) as never)
+  on('command.run', (_$, e) => {
+    w.commands.push(e.command)
+    w.onCommand(e.command)
+    return { text: '' } as never
+  })
   on('fs.stat', (_$, e) => {
     const f = w.files.get(e.path)
     if (!f) throw new Error(`ENOENT ${e.path}`)
@@ -391,6 +399,86 @@ describe('reporter', () => {
     expect(w.posts.map(p => p.init.headers?.['X-Report-Key'])).toEqual([reportKey(A), reportKey(B)])
     expect(bodies(w).map(b => b.items.map(i => [i.seq, amount(i)]))).toEqual([[[1, 1.5]], [[2, 0.75]]])
     expect(booked(w)).toBe(2.25) // nothing twice
+  })
+
+  test('/login: what grew since the last turn counts for the old account and goes out at once', async ($, on) => {
+    const w = world(on)
+    login(w, A, 'a@example.test')
+    const clock = mock.clock(on, { now: T0 })
+    await start($)
+    await turn($, w, 1)
+    await clock.advance(MIN)
+    w.cost = 1.4 // a background agent finished after the turn
+    w.onCommand = name => {
+      if (name === 'login') login(w, B, 'b@example.test')
+    }
+    await $.command.run({ command: 'login', args: '' } as never)
+    expect(w.commands).toEqual(['login']) // the command itself runs
+    await clock.advance(10)
+    expect(w.posts.length).toBe(2)
+    expect(w.posts[1]!.init.headers?.['X-Report-Key']).toBe(reportKey(A))
+    expect(bodies(w)[1]!.items.map(i => [i.from_usd, i.to_usd])).toEqual([[1, 1.4]])
+    await turn($, w, 2)
+    await clock.advance(MIN)
+    expect(w.posts[2]!.init.headers?.['X-Report-Key']).toBe(reportKey(B))
+    expect(bodies(w)[2]!.items.map(i => [i.from_usd, i.to_usd])).toEqual([[1.4, 2]])
+    expect(booked(w)).toBe(2)
+  })
+
+  test('/logout: the last stretch still counts for the account before it', async ($, on) => {
+    const w = world(on)
+    login(w, A)
+    const clock = mock.clock(on, { now: T0 })
+    await start($)
+    await turn($, w, 0.5)
+    w.cost = 0.75
+    w.onCommand = name => {
+      if (name === 'logout') login(w, null)
+    }
+    await $.command.run({ command: 'logout', args: '' } as never)
+    await clock.advance(10)
+    expect(w.posts.map(p => p.init.headers?.['X-Report-Key'])).toEqual([reportKey(A)])
+    expect(booked(w)).toBe(0.75)
+  })
+
+  test('background agents: read when one ends and every minute, nobody has to type', async ($, on) => {
+    const w = world(on)
+    login(w, A)
+    const clock = mock.clock(on, { now: T0 })
+    await start($)
+    await turn($, w, 1)
+    await clock.advance(MIN)
+    w.cost = 1.2
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'bg', agentId: 'bg1', reason: 'answer', usage: USAGE } as never)
+    w.cost = 1.5 // another agent still runs
+    await clock.advance(MIN)
+    expect(bodies(w)[1]!.items.map(i => [i.from_usd, i.to_usd])).toEqual([[1, 1.5]])
+    w.cost = 1.9
+    await clock.advance(MIN)
+    expect(bodies(w)[2]!.items.map(i => [i.from_usd, i.to_usd])).toEqual([[1.5, 1.9]])
+    expect(booked(w)).toBe(1.9)
+  })
+
+  test('the minute tick inside a turn counts for the account at its turn.start', async ($, on) => {
+    const w = world(on)
+    login(w, A)
+    const clock = mock.clock(on, { now: T0 })
+    await start($)
+    await turn($, w, 1)
+    await $.turn.start({ text: 'long', turnId: 'long' } as never)
+    login(w, B) // another process logs this config folder in elsewhere
+    w.cost = 1.6
+    await clock.advance(MIN)
+    w.cost = 2
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'long', reason: 'answer', usage: USAGE } as never)
+    await clock.advance(MIN)
+    expect(new Set(w.posts.map(p => p.init.headers?.['X-Report-Key']))).toEqual(new Set([reportKey(A)]))
+    expect(booked(w)).toBe(2)
+    // after the turn the tick follows the file
+    w.cost = 2.3
+    await clock.advance(MIN)
+    expect(w.posts.at(-1)!.init.headers?.['X-Report-Key']).toBe(reportKey(B))
+    expect(booked(w)).toBe(2.3)
   })
 
   test('.claude.json is read again only when it changed', async ($, on) => {
