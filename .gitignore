@@ -1,0 +1,4 @@
+node_modules/
+.DS_Store
+# written by the engine when the plugin is loaded from this folder
+.claude-plugin/types/

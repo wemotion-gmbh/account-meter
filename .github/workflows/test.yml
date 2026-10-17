@@ -1,0 +1,55 @@
+# Plugin tests and the surface check, on every push and pull request.
+# A release tag is only made from main after this is green (README "Release").
+#
+# Claude Code runs the tests itself (`claude plugin test`, the engine's own
+# test host; no login, no model request). The binary is pinned like the box
+# image (kubernetes-backbone-hetzner tools/claude-accounts/box/Dockerfile):
+# version and SHA256 from
+#   https://downloads.claude.ai/claude-code-releases/<version>/manifest.json
+# (platforms.linux-x64.checksum). Bump both together.
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CLAUDE_VERSION: 2.1.301
+      CLAUDE_SHA256: bc1aad9982c7b59c7d889ff92595d61cf46e0a6eae074cb551d932a989bcd222
+      DISABLE_AUTOUPDATER: '1'
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Surface check (fetch only our host, no auth, reporter env CLAUDE_CONFIG_DIR only)
+        run: ./scripts/check-surface.sh
+
+      - name: Install Claude Code (pinned, checksum verified)
+        run: |
+          set -eu
+          dir="$RUNNER_TEMP/claude-bin"
+          mkdir -p "$dir"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$dir/claude" \
+            "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude"
+          echo "${CLAUDE_SHA256}  $dir/claude" | sha256sum -c -
+          chmod 0755 "$dir/claude"
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: Claude Code version
+        run: |
+          got="$(claude --version)"
+          echo "$got"
+          case "$got" in "${CLAUDE_VERSION} "*) ;; *) echo "want ${CLAUDE_VERSION}" >&2; exit 1 ;; esac
+
+      - name: Validate the plugin
+        run: claude plugin validate .
+
+      - name: Plugin tests
+        run: claude plugin test
