@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { hmacSha256, randomHex, sha256, sha256Hex, toHex, utf8 } from './crypto'
-import { buildBody, reportKey, signature } from './reporter'
+import { buildBody, reportKey, sessionKey, signature } from './reporter'
 
 describe('sha256', () => {
   test('known digests', () => {
@@ -38,16 +38,24 @@ describe('hmac-sha256 (RFC 4231)', () => {
 // CONTRACT-2.md "Testvektor": both sides check the same values.
 describe('contract test vector', () => {
   const uuid = '0f8fad5b-d9cb-469f-a165-70867728950e'
+  // The vector's body is from schema 1; the signature covers any bytes.
   const body = '{"schema":1,"process":"a1b2c3d4e5f60718","claude_version":"2.1.302","items":[{"seq":1,"cost_delta_usd":0.25}]}'
 
-  test('the plugin builds exactly this body', () => {
-    expect(buildBody('a1b2c3d4e5f60718', '2.1.302', [{ seq: 1, cost_delta_usd: 0.25 }])).toBe(body)
+  test('the plugin builds a schema 2 body, fields in this order', () => {
+    const item = { seq: 1, session: '9f2c4e1a0b3d5f68', from_usd: 3.2, to_usd: 3.45 }
+    expect(buildBody('a1b2c3d4e5f60718', '2.1.302', [item])).toBe(
+      '{"schema":2,"process":"a1b2c3d4e5f60718","claude_version":"2.1.302","items":[{"seq":1,"session":"9f2c4e1a0b3d5f68","from_usd":3.2,"to_usd":3.45}]}')
   })
   test('key', () => {
     expect(reportKey(uuid)).toBe('042b577824715251')
   })
   test('signature', () => {
     expect(signature(uuid, '1792224000', body)).toBe('b81d5ab4f651e7a009246d327c47fca48e67d84aab04c6ceda5187732442ca82')
+  })
+  test('session key: 16 hex of sha256, a new one per epoch', () => {
+    const sid = '4f1c2e8a-0000-4000-8000-000000000001'
+    expect(sessionKey(sid, 0)).toBe('6b53ad7506d1db22')
+    expect(sessionKey(sid, 1)).toBe('7aa1c43f4de54782')
   })
 })
 

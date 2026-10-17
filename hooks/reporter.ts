@@ -25,13 +25,22 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 export type Identity = { uuid: string; key: string; email: string | null }
 export type Check = { five_hour_resets_at?: number; seven_day_resets_at?: number }
-export type Item = { readonly seq: number; readonly cost_delta_usd: number; readonly check?: Readonly<Check> }
+export type Item = {
+  readonly seq: number
+  readonly session: string
+  readonly from_usd: number
+  readonly to_usd: number
+  readonly check?: Readonly<Check>
+}
+// A stretch of one session's running sum, booked to one account.
+type Span = { session: string; from: number; to: number }
 
 // One account of this process: what is collected but not sent yet (`draft`,
-// it may still grow) and the items sent at least once (fixed from then on).
+// the last span may still grow) and the items sent at least once (fixed from
+// then on).
 type Account = {
   who: Identity
-  draft: number
+  draft: Span[]
   check: Check | undefined
   items: Item[]
   restUntil: number
@@ -61,7 +70,15 @@ export function signature(uuid: string, time: string, body: string): string {
 }
 
 export function buildBody(processId: string, version: string, items: readonly Item[]): string {
-  return JSON.stringify({ schema: 1, process: processId, claude_version: version, items })
+  return JSON.stringify({ schema: 2, process: processId, claude_version: version, items })
+}
+
+// The session as the app sees it. Two copies of this plugin in one process see
+// the same session and the same sums, so they send the same ranges and the app
+// books them once. `epoch` counts falls of the sum (normally 0), so a sum that
+// starts over does not land on ranges already booked.
+export function sessionKey(sessionId: string, epoch: number): string {
+  return sha256Hex(`account-meter:${sessionId}:${epoch}`).slice(0, 16)
 }
 
 // The home folder, found without reading HOME (the reporter reads no
@@ -190,9 +207,9 @@ export type Reporter = {
   stamp: string | null
   current: Identity | null
   fileNote: string
-  // The session whose cost this process follows: the last sum seen, and who
-  // worked at its latest turn.start.
-  tracked: { sid: string; last: number; who: Identity | null } | null
+  // The session whose cost this process follows: the last sum seen, who
+  // worked at its latest turn.start, and its key for the app.
+  tracked: Tracked | null
   turns: Map<string, Identity | null>
   accounts: Map<string, Account>
   timer: { cancel: () => void } | null
@@ -201,6 +218,23 @@ export type Reporter = {
   lastAnswer: { at: number; text: string } | null
   clockHint: boolean
   logged: Set<string>
+}
+
+type Tracked = { sid: string; last: number; who: Identity | null; epoch: number; key: string }
+
+const track = (sid: string, last: number, who: Identity | null): Tracked =>
+  ({ sid, last, who, epoch: 0, key: sessionKey(sid, 0) })
+
+// The sum is now `usd`: the span since the last reading, or null when it did
+// not grow (a fall starts a new epoch from the new sum).
+function advance(t: Tracked, usd: number): { from: number; to: number } | null {
+  const from = t.last
+  t.last = usd
+  if (usd < from) {
+    t.epoch++
+    t.key = sessionKey(t.sid, t.epoch)
+  }
+  return usd > from ? { from, to: usd } : null
 }
 
 export function newReporter(): Reporter {
@@ -273,31 +307,43 @@ async function reading($: EngineInterface): Promise<{ usd: number | null; rateLi
   }
 }
 
-function book(r: Reporter, who: Identity, usd: number, check: Check | undefined): void {
+function book(r: Reporter, who: Identity, key: string, span: { from: number; to: number }, check: Check | undefined): void {
   let acc = r.accounts.get(who.uuid)
   if (!acc) {
-    acc = { who, draft: 0, check: undefined, items: [], restUntil: 0, muted: false, maxItems: MAX_ITEMS }
+    acc = { who, draft: [], check: undefined, items: [], restUntil: 0, muted: false, maxItems: MAX_ITEMS }
     r.accounts.set(who.uuid, acc)
   }
   acc.who = who
   if (acc.muted) return
-  acc.draft += usd
+  const last = acc.draft[acc.draft.length - 1]
+  if (last && last.session === key && last.to === span.from) last.to = span.to
+  else acc.draft.push({ session: key, from: span.from, to: span.to })
   if (check) acc.check = check
 }
 
+const drafted = (acc: Account) => acc.draft.reduce((sum, s) => sum + (round6(s.to) - round6(s.from)), 0)
+
 // Turns what was collected into items; an item never changes after this.
+// Ranges are rounded to the micro dollar at both ends, so spans that touch
+// stay touching.
 function freeze(r: Reporter, acc: Account, nowSec: number): void {
-  while (acc.items.length < acc.maxItems) {
-    const usd = Math.min(round6(acc.draft), MAX_ITEM_USD)
-    if (!(usd > 0)) break
-    acc.draft -= usd
+  while (acc.items.length < acc.maxItems && acc.draft.length > 0) {
+    const s = acc.draft[0]!
+    const from = round6(s.from)
+    const end = round6(s.to)
+    if (!(end > from)) {
+      acc.draft.shift()
+      continue
+    }
+    const to = Math.min(end, round6(from + MAX_ITEM_USD))
+    if (to < end) s.from = to
+    else acc.draft.shift()
     const check = future(acc.check, nowSec)
     const seq = ++r.seq
-    acc.items.push(Object.freeze(check
-      ? { seq, cost_delta_usd: usd, check: Object.freeze(check) }
-      : { seq, cost_delta_usd: usd }))
+    const item = { seq, session: s.session, from_usd: from, to_usd: to }
+    acc.items.push(Object.freeze(check ? { ...item, check: Object.freeze(check) } : item))
   }
-  if (!(round6(acc.draft) > 0)) acc.check = undefined
+  if (acc.draft.length === 0) acc.check = undefined
 }
 
 function drop(acc: Account, batch: readonly Item[]): void {
@@ -324,7 +370,7 @@ async function sendOne($: EngineInterface, r: Reporter, acc: Account, timeoutMs:
     },
     body,
   }
-  const usd = batch.reduce((sum, i) => sum + i.cost_delta_usd, 0)
+  const usd = batch.reduce((sum, i) => sum + (i.to_usd - i.from_usd), 0)
   r.lastReport = { at: sentAt, text: `${n} item(s), ${usd.toFixed(4)} USD for ${acc.who.email ?? acc.who.key}` }
   const res: HttpResponse | null = await within($, $.http.fetch(REPORT_URL, init).catch(() => null), timeoutMs)
   const out = classify(res)
@@ -354,7 +400,7 @@ async function sendOne($: EngineInterface, r: Reporter, acc: Account, timeoutMs:
     case 'mismatch':
       acc.muted = true
       acc.items = []
-      acc.draft = 0
+      acc.draft = []
       acc.check = undefined
       return true
     case 'clock':
@@ -409,7 +455,7 @@ export async function reporterTurnStart($: EngineInterface, r: Reporter, e: Turn
     // The first turn of this session in this process: what it cost so far
     // (a resumed or forked session brings its old sum) is the base.
     const { usd } = await reading($)
-    r.tracked = usd === null ? null : { sid, last: usd, who }
+    r.tracked = usd === null ? null : track(sid, usd, who)
   } catch {
     // never disturb the session
   }
@@ -428,15 +474,14 @@ export async function reporterTurnComplete($: EngineInterface, r: Reporter, e: T
       return
     }
     if (!r.tracked || r.tracked.sid !== sid) {
-      r.tracked = { sid, last: now.usd, who }
+      r.tracked = track(sid, now.usd, who)
       return
     }
-    const delta = now.usd - r.tracked.last
-    r.tracked.last = now.usd // a falling sum is simply the new base
-    if (!known || !who || !(delta > 0)) return
+    const span = advance(r.tracked, now.usd)
+    if (!known || !who || !span) return
     // Reset times only from a turn with responses of its own, never older ones.
     const check = e.usage ? checkFrom(now.rateLimits, Math.floor((await $.clock.now()) / 1000)) : undefined
-    book(r, who, delta, check)
+    book(r, who, r.tracked.key, span, check)
   } catch {
     // never disturb the session
   }
@@ -451,11 +496,8 @@ export async function reporterEnd(
     const t = r.tracked
     if (t && t.sid === e.sessionId && (await $.session.id()) === e.sessionId) {
       const { usd } = await reading($)
-      if (usd !== null) {
-        const delta = usd - t.last
-        t.last = usd
-        if (delta > 0 && t.who) book(r, t.who, delta, undefined)
-      }
+      const span = usd === null ? null : advance(t, usd)
+      if (span && t.who) book(r, t.who, t.key, span, undefined)
     }
     if (e.reason === 'clear' || e.reason === 'resume') {
       // The process goes on under another session: the next round sends.
@@ -487,7 +529,8 @@ export async function reporterStatus($: EngineInterface, r: Reporter): Promise<s
   for (const a of r.accounts.values()) {
     const parts: string[] = []
     if (a.items.length) parts.push(`${a.items.length} item(s) waiting for an answer`)
-    if (round6(a.draft) > 0) parts.push(`${a.draft.toFixed(4)} USD collected`)
+    const usd = drafted(a)
+    if (round6(usd) > 0) parts.push(`${usd.toFixed(4)} USD collected`)
     if (a.restUntil > now) parts.push(`resting until ${iso(a.restUntil)}`)
     if (a.muted) parts.push('silent in this process (mismatch)')
     if (parts.length) open.push(`${a.who.email ?? a.who.key}: ${parts.join(', ')}`)
