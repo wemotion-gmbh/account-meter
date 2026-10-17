@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { hmacSha256Hex } from './crypto'
-import { checkFrom, classify, homeFromRoot, MAX_ITEMS, normalizeUuid, REPORT_URL, reportKey, sessionKey } from './reporter'
+import { checkFrom, classify, homeFromRoot, MAX_ITEMS, normalizeUuid, REPORT_URL, reportKey, sessionKey, WATCH_MS } from './reporter'
 
 const T0 = Date.parse('2026-10-17T08:00:00Z')
 const MIN = 60_000
@@ -385,13 +385,13 @@ describe('reporter', () => {
     expect(booked(w)).toBe(0.6)
   })
 
-  test('/login in the middle of a session: each turn counts for the account at its turn.start', async ($, on) => {
+  test('/login in another window during a turn: what grew before it is noticed stays with the old account', async ($, on) => {
     const w = world(on)
     login(w, A, 'a@example.test')
     const clock = mock.clock(on, { now: T0 })
     await start($)
     await turn($, w, 1)
-    // the file changes while a turn runs: that turn stays with A
+    // the file changes while a turn runs and is noticed at its end: its cost so far is A's
     await turn($, w, 1.5, { between: () => login(w, B, 'b@example.test') })
     await turn($, w, 2.25) // B from here on
     await clock.advance(MIN)
@@ -459,26 +459,64 @@ describe('reporter', () => {
     expect(booked(w)).toBe(1.9)
   })
 
-  test('the minute tick inside a turn counts for the account at its turn.start', async ($, on) => {
+  test('a /login in another window splits a running turn where the file changes', async ($, on) => {
+    const w = world(on)
+    login(w, A, 'a@example.test')
+    const clock = mock.clock(on, { now: T0 })
+    await start($)
+    await turn($, w, 1)
+    await $.turn.start({ text: 'long', turnId: 'long' } as never)
+    w.cost = 1.6
+    await clock.advance(5_000)
+    login(w, B, 'b@example.test') // /login in another window on this config folder
+    await clock.advance(WATCH_MS) // noticed within a second: 1..1.6 was A's
+    w.cost = 2
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'long', reason: 'answer', usage: USAGE } as never)
+    await clock.advance(MIN)
+    const byKey = new Map<string, number>()
+    for (const p of w.posts) {
+      const k = p.init.headers!['X-Report-Key']!
+      for (const i of (JSON.parse(p.init.body!) as Body).items) byKey.set(k, Math.round(((byKey.get(k) ?? 0) + amount(i)) * 1e6) / 1e6)
+    }
+    expect(byKey).toEqual(new Map([[reportKey(A), 1.6], [reportKey(B), 0.4]]))
+    // the turn's reset times go with B, the account its last answer came from
+    const last = bodies(w).flatMap(b => b.items).find(i => i.from_usd === 1.6)!
+    expect(last.check).toBeDefined()
+  })
+
+  test('a switch while nobody types: a background agent\'s cost before it stays with the old account', async ($, on) => {
     const w = world(on)
     login(w, A)
     const clock = mock.clock(on, { now: T0 })
     await start($)
     await turn($, w, 1)
-    await $.turn.start({ text: 'long', turnId: 'long' } as never)
-    login(w, B) // another process logs this config folder in elsewhere
-    w.cost = 1.6
+    w.cost = 1.25 // a background agent
+    login(w, B, 'b@example.test')
+    await clock.advance(WATCH_MS)
+    w.cost = 1.5
     await clock.advance(MIN)
-    w.cost = 2
-    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'long', reason: 'answer', usage: USAGE } as never)
+    expect(w.posts.map(p => [p.init.headers?.['X-Report-Key'], (JSON.parse(p.init.body!) as Body).items.map(i => [i.from_usd, i.to_usd])])).toEqual([
+      [reportKey(A), [[0, 1.25]]],
+      [reportKey(B), [[1.25, 1.5]]],
+    ])
+  })
+
+  test('a half-written or briefly missing account file is no logout', async ($, on) => {
+    const w = world(on)
+    login(w, A)
+    const clock = mock.clock(on, { now: T0 })
+    await start($)
+    await turn($, w, 1)
+    w.files.set(FILE, { text: '{"numStartups": 3, "oauthAcc', mtimeMs: fileClock++ })
+    w.cost = 1.2
+    await clock.advance(WATCH_MS)
+    w.files.delete(FILE)
+    await clock.advance(WATCH_MS)
+    login(w, A)
+    await turn($, w, 1.5)
     await clock.advance(MIN)
     expect(new Set(w.posts.map(p => p.init.headers?.['X-Report-Key']))).toEqual(new Set([reportKey(A)]))
-    expect(booked(w)).toBe(2)
-    // after the turn the tick follows the file
-    w.cost = 2.3
-    await clock.advance(MIN)
-    expect(w.posts.at(-1)!.init.headers?.['X-Report-Key']).toBe(reportKey(B))
-    expect(booked(w)).toBe(2.3)
+    expect(booked(w)).toBe(1.5)
   })
 
   test('.claude.json is read again only when it changed', async ($, on) => {
@@ -642,7 +680,7 @@ describe('reporter', () => {
     expect(bodies(w)[1]!.items.map(i => [i.seq, amount(i)])).toEqual([[1, 1], [2, 0.5]])
   })
 
-  test('422 mismatch silences that account for the process; another account goes on', async ($, on) => {
+  test('422 mismatch drops that account\'s items and silences it for an hour; another account goes on', async ($, on) => {
     const w = world(on)
     login(w, A)
     const clock = mock.clock(on, { now: T0 })
@@ -653,14 +691,21 @@ describe('reporter', () => {
     await turn($, w, 2)
     await clock.advance(2 * MIN)
     expect(w.posts.length).toBe(1)
+    const st = await $.command.run({ command: 'account-meter', args: 'status' } as never)
+    expect(st.text).toMatch(/a@example\.test: .*silent until .* \(mismatch\)/)
     login(w, B, 'b@example.test')
     await turn($, w, 2.5)
     await clock.advance(MIN)
     expect(w.posts.length).toBe(2)
     expect(w.posts[1]!.init.headers?.['X-Report-Key']).toBe(reportKey(B))
     expect(bodies(w)[1]!.items.map(i => amount(i))).toEqual([0.5])
-    const st = await $.command.run({ command: 'account-meter', args: 'status' } as never)
-    expect(st.text).toMatch(/a@example\.test: silent in this process \(mismatch\)/)
+    // an hour later A reports again what it works from then on
+    await clock.advance(60 * MIN)
+    login(w, A)
+    await turn($, w, 2.75)
+    await clock.advance(MIN)
+    expect(w.posts.at(-1)!.init.headers?.['X-Report-Key']).toBe(reportKey(A))
+    expect((JSON.parse(w.posts.at(-1)!.init.body!) as Body).items.map(i => amount(i))).toEqual([0.25])
   })
 
   test('429, 3xx, 404, 503 unavailable, 5xx, non-JSON, network errors and timeouts keep the items for the next round', async ($, on) => {

@@ -29,19 +29,21 @@ session, and the app books each range once.
 
 **Which account.** `oauthAccount.accountUuid` from `$CLAUDE_CONFIG_DIR/.claude.json`, else
 `~/.claude.json` (the home folder is taken from the plugin's own folder, as no `HOME` is read). The
-file is read again at a turn's start only when it changed, so after a `/login` the next turn counts
-for the new account. Without an `accountUuid` (API key, gateway) nothing is reported. The plugin
+file is looked at every second (`stat`; read only when it changed). Every Claude Code window on one
+config folder shares it, and a `/login` in any of them switches them all: what grew up to that
+moment counts for the old account, from then on for the new one, also in the middle of a turn. A
+file that is half written or missing for a moment keeps the account known so far. Without an `accountUuid` (API key, gateway) nothing is reported. The plugin
 reads no environment variable but `CLAUDE_CONFIG_DIR`, never a token, and asks Anthropic nothing.
 
 **What counts.** Claude Code's own cost estimate (`/cost`, list price unless managed settings set
 other prices), as the growth per session in this process:
 - the base is the sum at the session's first turn in this process (a resumed or forked session
   brings its old sum, which is never reported again);
-- growth counts after each of its own turns, for the account at that turn's start;
+- growth counts after each of its own turns;
 - what grows outside a turn's end (a background agent, a `/compact`) is read when a subagent ends,
-  every minute, and right before `/login` and `/logout` (then sent at once), for the account logged
-  in at that moment; during a turn for that turn's account. So a `/login` never moves cost to the
-  new account;
+  every minute, right before `/login` and `/logout` (then sent at once) and when the account file
+  switches, for the account logged in at that moment. So a `/login`, here or in another window,
+  never moves cost to the other account;
 - a new session id (`/clear`, `/resume`) or a falling sum starts a new base: jumps never count
   (after a fall the session gets a new key, see `session` below);
 - at the end of the process one last reading is sent at once.
@@ -85,7 +87,7 @@ receipt settles items.
 
 **Answers.** `200` receipt: `ok`/`duplicate`/`rejected` settle an item. `400 invalid`: dropped, logged
 once (debug log). `413`: smaller requests. `422 unknown_account`: this account rests for 1 h, items
-kept. `422 mismatch`: this account stays silent in this process. Anything else (`401`, `429`, `3xx`,
+kept. `422 mismatch`: that account's items are dropped and it stays silent for 1 h. Anything else (`401`, `429`, `3xx`,
 `404`, `5xx`, timeout, no JSON): kept, sent again in the next round. An item never changes after its
 first sending. The session is never disturbed: no toast, no status line, no model request.
 
