@@ -24,6 +24,10 @@ const MAX_OPEN_TURNS = 64
 // How long a hook waits for the reporter: a reading outside a turn's end,
 // and a turn's own start and end.
 const CHECKPOINT_MS = 2_000
+// How often the account file is looked at: a `stat`, read only when it
+// changed; a switch counts from at most this long after it (Alex: every
+// second is enough).
+export const WATCH_MS = 1_000
 const HOOK_MS = 5_000
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
@@ -214,9 +218,11 @@ export type Reporter = {
   // The session whose cost this process follows: the last sum seen and its
   // key for the app.
   tracked: Tracked | null
-  turns: Map<string, Identity | null>
-  // The main-loop turn running now (from its turn.start to its turn.complete).
-  openTurn: string | null
+  // Main-loop turns seen starting in this process.
+  turns: Set<string>
+  // Who the cost since the last reading belongs to; undefined: not looked yet.
+  who: Identity | null | undefined
+  watch: { cancel: () => void } | null
   // Readings one at a time: one that overtook another would look like a fall.
   chain: Promise<unknown>
   accounts: Map<string, Account>
@@ -248,7 +254,7 @@ export function newReporter(): Reporter {
   return {
     processId: randomHex(8), seq: 0, version: 'unknown',
     file: undefined, stamp: null, current: null, fileNote: 'not read yet',
-    tracked: null, turns: new Map(), openTurn: null, chain: Promise.resolve(), accounts: new Map(),
+    tracked: null, turns: new Set(), who: undefined, watch: null, chain: Promise.resolve(), accounts: new Map(),
     timer: null, inflight: null, lastReport: null, lastAnswer: null, clockHint: false, logged: new Set(),
   }
 }
@@ -280,8 +286,10 @@ async function accountFile($: EngineInterface, r: Reporter): Promise<string | nu
 }
 
 // Who this process works for, from oauthAccount in .claude.json. The file is
-// read again only when it changed (a /login rewrites it, as does much else);
-// an unreadable file counts as no account until it reads again.
+// read again only when it changed (a /login rewrites it, as does much else).
+// A file that cannot be stat'ed or read for a moment keeps the account known
+// so far (looked at every second, a half-written file must not look like a
+// logout); only a file that reads without an account means none.
 async function identity($: EngineInterface, r: Reporter): Promise<Identity | null> {
   const path = await accountFile($, r)
   if (!path) {
@@ -295,24 +303,22 @@ async function identity($: EngineInterface, r: Reporter): Promise<Identity | nul
     s = `${st.mtimeMs}:${st.size}`
   } catch {
     r.stamp = null
-    r.current = null
     r.fileNote = `${path} not found`
-    return null
+    return r.current
   }
   if (s === r.stamp) return r.current
   r.stamp = null
   const before = r.current
-  r.current = null
   try {
     const cfg: unknown = JSON.parse(await $.fs.read(path))
     const acc = isObj(cfg) && isObj(cfg.oauthAccount) ? cfg.oauthAccount : null
     const uuid = normalizeUuid(acc?.accountUuid)
     const email = typeof acc?.emailAddress === 'string' ? acc.emailAddress : null
-    if (uuid) r.current = { uuid, key: before?.uuid === uuid ? before.key : reportKey(uuid), email }
+    r.current = uuid ? { uuid, key: before?.uuid === uuid ? before.key : reportKey(uuid), email } : null
     r.fileNote = uuid ? path : `no oauthAccount.accountUuid in ${path}`
     r.stamp = s
   } catch {
-    r.fileNote = `${path} unreadable, read again at the next turn`
+    r.fileNote = `${path} unreadable, read again in a second`
   }
   return r.current
 }
@@ -340,20 +346,33 @@ function book(r: Reporter, who: Identity, key: string, span: { from: number; to:
   if (check) acc.check = check
 }
 
-// What the session cost since the last reading, outside a turn's own end: a
-// background agent, a /compact, the minute tick, the moment before /login.
-// It belongs to the account of the main-loop turn running now, else to the
-// account logged in now (before /login: still the old one). Callers hold the
-// chain.
-async function checkpointNow($: EngineInterface, r: Reporter): Promise<void> {
+// What the session cost since the last reading goes to `who`. Callers hold
+// the chain.
+async function growth($: EngineInterface, r: Reporter, who: Identity | null): Promise<void> {
   const t = r.tracked
   if (!t || (await $.session.id()) !== t.sid) return
   const { usd } = await reading($)
   if (usd === null || r.tracked !== t) return
   const span = advance(t, usd)
-  if (!span) return
-  const who = r.openTurn !== null ? (r.turns.get(r.openTurn) ?? null) : await identity($, r)
-  if (who) book(r, who, t.key, span, undefined)
+  if (span && who) book(r, who, t.key, span, undefined)
+}
+
+// Who works now. Every Claude Code window on this config folder shares the
+// account file, and a /login in any of them switches them all, also in the
+// middle of a turn. So on a change, what grew up to now is the old
+// account's, from now on the new one's. Callers hold the chain.
+async function observe($: EngineInterface, r: Reporter): Promise<Identity | null> {
+  const now = await identity($, r)
+  if (r.who !== undefined && (r.who?.uuid ?? null) !== (now?.uuid ?? null)) await growth($, r, r.who)
+  r.who = now
+  return now
+}
+
+// What grew since the last reading, outside a turn's end: a background agent,
+// a /compact, the minute tick, the moment before /login. Callers hold the
+// chain.
+async function checkpointNow($: EngineInterface, r: Reporter): Promise<void> {
+  await growth($, r, await observe($, r))
 }
 
 const drafted = (acc: Account) => acc.draft.reduce((sum, s) => sum + (round6(s.to) - round6(s.from)), 0)
@@ -433,7 +452,10 @@ async function sendOne($: EngineInterface, r: Reporter, acc: Account, timeoutMs:
       acc.restUntil = sentAt + REST_MS
       return true
     case 'mismatch':
+      // The reset times say another account worked: drop what was collected
+      // and stay silent for this account for a while.
       acc.muted = true
+      acc.restUntil = sentAt + REST_MS
       acc.items = []
       acc.draft = []
       acc.check = undefined
@@ -452,6 +474,7 @@ async function sendAll($: EngineInterface, r: Reporter, timeoutMs: number): Prom
   // Oldest items first, so the numbers reach the app in their order.
   const order = [...r.accounts.values()].sort((a, b) => (a.items[0]?.seq ?? Infinity) - (b.items[0]?.seq ?? Infinity))
   for (const acc of order) {
+    if (acc.muted && acc.restUntil <= now) acc.muted = false
     if (acc.muted || acc.restUntil > now) continue
     freeze(r, acc, nowSec)
     if (acc.items.length === 0) continue
@@ -475,6 +498,10 @@ export async function reporterStart($: EngineInterface, r: Reporter): Promise<vo
   }
   r.timer?.cancel()
   r.timer = $.clock.every(SEND_EVERY_MS, () => void tick($, r))
+  // A /login in another window shows only in the account file (the engine has
+  // no file watch): looked at every second, it draws the line close to it.
+  r.watch?.cancel()
+  r.watch = $.clock.every(WATCH_MS, () => void guarded($, r, async () => void (await observe($, r))))
 }
 
 // Every minute: what grew meanwhile (a background agent while nobody types),
@@ -498,10 +525,9 @@ export function reporterTurnStart($: EngineInterface, r: Reporter, e: TurnStartI
 
 async function turnStart($: EngineInterface, r: Reporter, e: TurnStartInput): Promise<void> {
   try {
-    const who = await identity($, r)
-    r.turns.set(e.turnId, who)
-    r.openTurn = e.turnId
-    if (r.turns.size > MAX_OPEN_TURNS) r.turns.delete(r.turns.keys().next().value!)
+    await observe($, r)
+    r.turns.add(e.turnId)
+    if (r.turns.size > MAX_OPEN_TURNS) r.turns.delete(r.turns.values().next().value!)
     const sid = await $.session.id()
     if (r.tracked && r.tracked.sid === sid) return
     // The first turn of this session in this process: what it cost so far
@@ -522,10 +548,9 @@ export function reporterTurnComplete($: EngineInterface, r: Reporter, e: TurnCom
 
 async function turnComplete($: EngineInterface, r: Reporter, e: TurnCompleteInput): Promise<void> {
   try {
-    const known = r.turns.has(e.turnId)
-    const who = r.turns.get(e.turnId) ?? null
-    r.turns.delete(e.turnId)
-    if (r.openTurn === e.turnId) r.openTurn = null
+    const known = r.turns.delete(e.turnId)
+    // A switch not noticed yet: what grew before it is the old account's.
+    const who = await observe($, r)
     const sid = await $.session.id()
     const now = await reading($)
     if (now.usd === null) {
@@ -587,8 +612,8 @@ export async function reporterStatus($: EngineInterface, r: Reporter): Promise<s
     if (a.items.length) parts.push(`${a.items.length} item(s) waiting for an answer`)
     const usd = drafted(a)
     if (round6(usd) > 0) parts.push(`${usd.toFixed(4)} USD collected`)
-    if (a.restUntil > now) parts.push(`resting until ${iso(a.restUntil)}`)
-    if (a.muted) parts.push('silent in this process (mismatch)')
+    if (a.restUntil > now && !a.muted) parts.push(`resting until ${iso(a.restUntil)}`)
+    if (a.muted) parts.push(`silent until ${iso(a.restUntil)} (mismatch)`)
     if (parts.length) open.push(`${a.who.email ?? a.who.key}: ${parts.join(', ')}`)
   }
   lines.push(`Open: ${open.length ? open.join('; ') : 'nothing'}`)
