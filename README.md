@@ -70,7 +70,7 @@ other prices), as the growth per session in this process:
 No prompts, answers, file names, paths, repositories, hostnames or tokens. Nothing is stored on
 disk: a crash loses at most the last minute ("rather too little than twice").
 
-**Where.** Only `POST https://claude-accounts.k8s.backbone.canou.io/report/v1/usage`
+**Where.** Only `POST https://ai-accounts.k8s.backbone.canou.io/report/v1/usage`
 (`scripts/check-surface.sh` checks this in CI). No redirect is trusted: only a `200` with a JSON
 receipt settles items.
 

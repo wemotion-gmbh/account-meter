@@ -1,6 +1,6 @@
 {
   "name": "account-meter",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "Reports the estimated cost of Claude Code sessions per Claude account to claude-accounts (no content, no model request); in a claude-accounts box it measures the 5-hour / 7-day usage instead.",
   "author": {
     "name": "wemotion GmbH"

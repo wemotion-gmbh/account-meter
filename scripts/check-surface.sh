@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-URL='https://claude-accounts.k8s.backbone.canou.io/report/v1/usage'
+URL='https://ai-accounts.k8s.backbone.canou.io/report/v1/usage'
 BOX_ENV='ACCOUNT_METER_INTERVAL_S ACCOUNT_METER_JITTER_MS CLAUDE_ACCOUNT_METER_CHILD CLAUDE_CODE_EXECPATH CLAUDE_CONFIG_DIR HOME'
 fail=0
 bad() {

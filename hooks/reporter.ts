@@ -9,7 +9,7 @@ import type {
 import { hmacSha256Hex, randomHex, sha256Hex, utf8 } from './crypto'
 
 // The only address this plugin sends to (scripts/check-surface.sh checks it).
-export const REPORT_URL = 'https://claude-accounts.k8s.backbone.canou.io/report/v1/usage'
+export const REPORT_URL = 'https://ai-accounts.k8s.backbone.canou.io/report/v1/usage'
 // At most one request per account this often; everything in between is bundled.
 export const SEND_EVERY_MS = 60_000
 export const FETCH_TIMEOUT_MS = 15_000
