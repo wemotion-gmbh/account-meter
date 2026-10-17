@@ -38,9 +38,13 @@ other prices), as the growth per session in this process:
 - the base is the sum at the session's first turn in this process (a resumed or forked session
   brings its old sum, which is never reported again);
 - growth counts after each of its own turns, for the account at that turn's start;
+- what grows outside a turn's end (a background agent, a `/compact`) is read when a subagent ends,
+  every minute, and right before `/login` and `/logout` (then sent at once), for the account logged
+  in at that moment; during a turn for that turn's account. So a `/login` never moves cost to the
+  new account;
 - a new session id (`/clear`, `/resume`) or a falling sum starts a new base: jumps never count
   (after a fall the session gets a new key, see `session` below);
-- at the end of the process one last reading (a `/compact` after the last turn) is sent at once.
+- at the end of the process one last reading is sent at once.
 
 **What is sent**, at most once a minute per account, bundled:
 
