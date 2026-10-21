@@ -87,9 +87,10 @@ receipt settles items.
 
 **Answers.** `200` receipt: `ok`/`duplicate`/`rejected` settle an item. `400 invalid`: dropped, logged
 once (debug log). `413`: smaller requests. `422 unknown_account`: this account rests for 1 h, items
-kept. `422 mismatch`: that account's items are dropped and it stays silent for 1 h. Anything else (`401`, `429`, `3xx`,
+kept, and a toast tells the user once per process and account: "Dein Claude-Konto <E-Mail> ist nicht in
+AI-Accounts hinterlegt, Kosten werden nicht erfasst." (nothing more goes to the server). `422 mismatch`: that account's items are dropped and it stays silent for 1 h. Anything else (`401`, `429`, `3xx`,
 `404`, `5xx`, timeout, no JSON): kept, sent again in the next round. An item never changes after its
-first sending. The session is never disturbed: no toast, no status line, no model request.
+first sending. The session is never disturbed otherwise: no other toast, no status line, no model request.
 
 ## Box mode
 
