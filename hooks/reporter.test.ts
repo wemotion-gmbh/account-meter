@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { hmacSha256Hex } from './crypto'
-import { checkFrom, classify, homeFromRoot, MAX_ITEMS, normalizeUuid, REPORT_URL, reportKey, sessionKey, WATCH_MS } from './reporter'
+import { checkFrom, classify, homeFromRoot, MAX_ITEMS, normalizeUuid, REPORT_URL, reportKey, sessionKey, unknownHint, WATCH_MS } from './reporter'
 
 const T0 = Date.parse('2026-10-17T08:00:00Z')
 const MIN = 60_000
@@ -105,7 +105,7 @@ function world(on: On, o: { env?: Record<string, string> } = {}) {
     envNames: [] as string[],
     runs: 0,
     logs: [] as { text: string; to: string }[],
-    toasts: 0,
+    toasts: [] as string[],
     statuses: 0,
     // what a core command (/login) does when it runs
     commands: [] as string[],
@@ -159,8 +159,8 @@ function world(on: On, o: { env?: Record<string, string> } = {}) {
     w.logs.push({ text: e.text, to: e.to })
     return { value: undefined } as never
   })
-  on('ui.toast', () => {
-    w.toasts++
+  on('ui.toast', (_$, e) => {
+    w.toasts.push((e as { text?: string }).text ?? '')
     return { value: undefined } as never
   })
   on('ui.status', () => {
@@ -684,6 +684,35 @@ describe('reporter', () => {
     expect(bodies(w)[1]!.items.map(i => [i.seq, amount(i)])).toEqual([[1, 1], [2, 0.5]])
   })
 
+  test('422 unknown_account tells the user once per process and account, nothing more is sent', LONG, async ($, on) => {
+    const w = world(on)
+    login(w, A)
+    const clock = mock.clock(on, { now: T0 })
+    await start($)
+    await turn($, w, 1)
+    const unknown = { status: 422, text: '{"error":"unknown_account"}' }
+    w.replies.push(unknown, unknown)
+    await clock.advance(MIN)
+    expect(w.posts.length).toBe(1)
+    expect(w.toasts).toEqual(['account-meter: Dein Claude-Konto a@example.test ist nicht in AI-Accounts hinterlegt, Kosten werden nicht erfasst.'])
+    // the second 422 after the rest: no second toast
+    await clock.advance(61 * MIN)
+    expect(w.posts.length).toBe(2)
+    expect(w.toasts.length).toBe(1)
+    expect(w.posts.every(p => p.url === REPORT_URL)).toBe(true)
+    // another account in the same process gets its own hint
+    login(w, B, 'b@example.test')
+    await turn($, w, 2)
+    w.replies.push(unknown)
+    await clock.advance(MIN)
+    expect(w.posts.at(-1)!.init.headers?.['X-Report-Key']).toBe(reportKey(B))
+    expect(w.toasts).toEqual([unknownHint('a@example.test'), unknownHint('b@example.test')])
+  })
+
+  test('the unknown-account hint without an e-mail address', () => {
+    expect(unknownHint(null)).toBe('account-meter: Dein Claude-Konto ist nicht in AI-Accounts hinterlegt, Kosten werden nicht erfasst.')
+  })
+
   test('422 mismatch drops that account\'s items and silences it for an hour; another account goes on', LONG, async ($, on) => {
     const w = world(on)
     login(w, A)
@@ -792,7 +821,7 @@ describe('reporter', () => {
     expect(w.posts.length).toBe(0)
   })
 
-  test('no shell, no toast, no status line; only CLAUDE_CONFIG_DIR is read; only our host is asked', async ($, on) => {
+  test('no shell, no status line, a toast only for an unknown account; only CLAUDE_CONFIG_DIR is read; only our host is asked', async ($, on) => {
     const w = world(on)
     login(w, A)
     const clock = mock.clock(on, { now: T0 })
@@ -804,7 +833,7 @@ describe('reporter', () => {
     await $.session.end(end('prompt_input_exit'))
     await $.command.run({ command: 'account-meter', args: 'status' } as never)
     expect(w.runs).toBe(0)
-    expect(w.toasts).toBe(0)
+    expect(w.toasts).toEqual([unknownHint('a@example.test')])
     expect(w.statuses).toBe(0)
     expect(new Set(w.envNames)).toEqual(new Set(['CLAUDE_CONFIG_DIR']))
     expect(w.posts.length).toBeGreaterThan(0)

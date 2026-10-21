@@ -232,6 +232,8 @@ export type Reporter = {
   lastAnswer: { at: number; text: string } | null
   clockHint: boolean
   logged: Set<string>
+  // Report keys of the accounts already told they are unknown (hintUnknown).
+  hinted: Set<string>
 }
 
 type Tracked = { sid: string; last: number; epoch: number; key: string }
@@ -256,6 +258,7 @@ export function newReporter(): Reporter {
     file: undefined, stamp: null, current: null, fileNote: 'not read yet',
     tracked: null, turns: new Set(), who: undefined, watch: null, chain: Promise.resolve(), accounts: new Map(),
     timer: null, inflight: null, lastReport: null, lastAnswer: null, clockHint: false, logged: new Set(),
+    hinted: new Set(),
   }
 }
 
@@ -275,6 +278,24 @@ function logOnce($: EngineInterface, r: Reporter, key: string, text: string): vo
   if (r.logged.has(key)) return
   r.logged.add(key)
   $.ui.log(`account-meter: ${text}`, { to: 'debug' })
+}
+
+// 422 unknown_account: the user hears once per process and account, locally,
+// that the account is missing in claude-accounts (Alex: they should add it
+// themselves). Nothing more goes to the server.
+export function unknownHint(email: string | null): string {
+  const account = email ? `Dein Claude-Konto ${email}` : 'Dein Claude-Konto'
+  return `account-meter: ${account} ist nicht in AI-Accounts hinterlegt, Kosten werden nicht erfasst.`
+}
+
+function hintUnknown($: EngineInterface, r: Reporter, who: Identity): void {
+  if (r.hinted.has(who.key)) return
+  r.hinted.add(who.key)
+  try {
+    void Promise.resolve($.ui.toast(unknownHint(who.email))).catch(() => undefined)
+  } catch {
+    // no toast, the meter still works
+  }
 }
 
 async function accountFile($: EngineInterface, r: Reporter): Promise<string | null> {
@@ -450,6 +471,7 @@ async function sendOne($: EngineInterface, r: Reporter, acc: Account, timeoutMs:
       return true
     case 'unknown_account':
       acc.restUntil = sentAt + REST_MS
+      hintUnknown($, r, acc.who)
       return true
     case 'mismatch':
       // The reset times say another account worked: drop what was collected
