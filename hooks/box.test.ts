@@ -148,7 +148,7 @@ describe('child command', () => {
 // ACCOUNT_METER_JITTER_MS=0: no start offset, the first check (10 s) measures.
 type Call = { argv: readonly string[]; init?: { cwd?: string; env?: Record<string, string>; stdin?: string } }
 
-function world(on: On, o: { creds?: boolean; stdout?: string; exit?: number; fail?: boolean; messages?: string; jitter?: string; interval?: string; elsewhere?: boolean } = {}) {
+function world(on: On, o: { creds?: boolean; stdout?: string; exit?: number; fail?: boolean; messages?: string; jitter?: string; interval?: string; elsewhere?: boolean; config?: string } = {}) {
   const w = {
     runs: [] as Call[],
     files: new Map<string, string>(),
@@ -170,6 +170,7 @@ function world(on: On, o: { creds?: boolean; stdout?: string; exit?: number; fai
   on('session.start', () => ({ cwd: '/' }) as never)
   const env: Record<string, string> = { HOME: '/home/claude', CLAUDE_CODE_EXECPATH: '/opt/claude', ACCOUNT_METER_JITTER_MS: o.jitter ?? '0' }
   if (o.interval) env.ACCOUNT_METER_INTERVAL_S = o.interval
+  if (o.config) env.CLAUDE_CONFIG_DIR = o.config
   on('env.get', (_$, e) => ({ value: env[e.name] }) as never)
   on('session.version', () => ({ value: { version: '2.1.301' } }) as never)
   // The plugin under test runs from its checkout; resolved, it is the box folder.
@@ -532,6 +533,46 @@ describe('plugin', () => {
     await clock.advance(10_000)
     expect(childRuns(w)).toBe(1)
     expect(usageOf(w).account_uuid).toBe('uuid-1')
+  })
+
+  test('with CLAUDE_CONFIG_DIR set, its .claude.json names the account, and a switch there is measured', async ($, on) => {
+    const w = world(on, { config: '/cfg' })
+    write(w, '/cfg/.claude.json', JSON.stringify({ oauthAccount: { accountUuid: 'uuid-9', emailAddress: 'z@example.test' } }))
+    const clock = mock.clock(on, { now: 0 })
+    await start($)
+    await clock.advance(10_000)
+    expect(childRuns(w)).toBe(1)
+    expect(usageOf(w).account_uuid).toBe('uuid-9')
+    w.stdout = NO_RESET
+    write(w, '/cfg/.claude.json', JSON.stringify({ oauthAccount: { accountUuid: 'uuid-8', emailAddress: 'y@example.test' } }))
+    await clock.advance(10_000)
+    expect(childRuns(w)).toBe(2)
+    expect(usageOf(w).account_uuid).toBe('uuid-8')
+  })
+
+  test('a restart on the account usage.json names keeps the start offset', async ($, on) => {
+    const w = world(on, { jitter: '1000000000000' })
+    w.files.set(USAGE_PATH, JSON.stringify({ schema: 1, state: 'ok', measured_at: '2026-10-16T10:00:00Z', account_uuid: 'uuid-1' }))
+    const clock = mock.clock(on, { now: 0 })
+    await start($)
+    await clock.advance(30_000)
+    expect(childRuns(w)).toBe(0)
+  })
+
+  test("a switch whose first answer comes from the cache is held a minute, not measured again at the next check", async ($, on) => {
+    const w = world(on)
+    const clock = mock.clock(on, { now: Date.parse('2026-10-16T10:25:00Z') })
+    await start($)
+    await clock.advance(10_000)
+    expect(childRuns(w)).toBe(1)
+    w.stdout = CACHED
+    login(w, 'uuid-2', 'b@example.test')
+    await clock.advance(10_000)
+    expect(childRuns(w)).toBe(2)
+    await clock.advance(50_000)
+    expect(childRuns(w)).toBe(2)
+    await clock.advance(10_000)
+    expect(childRuns(w)).toBe(3)
   })
 
   test("the measuring child rewriting ~/.claude.json does not trigger another run", async ($, on) => {
