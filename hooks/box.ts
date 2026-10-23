@@ -11,8 +11,9 @@ const MAX_BACKOFF_MS = 30 * 60_000
 // Spreads the first measurement so a rollout does not start every box's
 // child at once.
 const JITTER_MS = 60_000
-// How often the (cheap) credentials check runs: a new login, a token refresh
-// or a logout is measured right away instead of at the next interval.
+// How often the (cheap) credentials and account check runs: a new login, a
+// token refresh, a logout or a switch to another account is measured right
+// away instead of at the next interval.
 const CHECK_MS = 10_000
 // Right after Claude starts, get_usage can answer without rate limits (seen
 // after every box restart). Until the first good value of this process that
@@ -211,7 +212,11 @@ export async function boxStart($: EngineInterface, box: Box): Promise<void> {
   if ((await $.env.get('CLAUDE_ACCOUNT_METER_CHILD')) !== undefined) return
 
   const home = (await $.env.get('HOME')) ?? '/home/claude'
-  const configDir = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${home}/.claude`
+  const configEnv = await $.env.get('CLAUDE_CONFIG_DIR')
+  const configDir = configEnv ?? `${home}/.claude`
+  // Claude Code's own file with the login (oauthAccount): in CLAUDE_CONFIG_DIR
+  // where that is set, else in the home folder.
+  const accountPath = configEnv ? `${configEnv}/.claude.json` : `${home}/.claude.json`
   const usagePath = `${home}/.claude-box/usage.json`
   const interval = intervalFrom(await $.env.get('ACCOUNT_METER_INTERVAL_S'))
   box.every = interval
@@ -243,7 +248,7 @@ export async function boxStart($: EngineInterface, box: Box): Promise<void> {
 
   const identity = async () => {
     try {
-      const cfg = JSON.parse(await $.fs.read(`${home}/.claude.json`)) as Record<string, unknown>
+      const cfg = JSON.parse(await $.fs.read(accountPath)) as Record<string, unknown>
       const acc = isObj(cfg.oauthAccount) ? cfg.oauthAccount : {}
       return {
         accountUuid: typeof acc.accountUuid === 'string' ? acc.accountUuid : null,
@@ -308,6 +313,7 @@ export async function boxStart($: EngineInterface, box: Box): Promise<void> {
     busy = true
     try {
       const u = await measure()
+      measuredFor = u.account_uuid
       if (!hadOk && u.state === 'error' && u.error === EMPTY_RATE_LIMITS && warmups < WARMUP_TRIES) {
         warmups++
         return 0
@@ -329,6 +335,29 @@ export async function boxStart($: EngineInterface, box: Box): Promise<void> {
       return null
     } finally {
       busy = false
+    }
+  }
+
+  // The account the last value was measured for: from usage.json at the start,
+  // then from each measurement (also one that is held back or retried).
+  let measuredFor: string | null | undefined = last ? last.account_uuid : undefined
+  // The account ~/.claude.json names now: read only when its stat changed (the
+  // measuring child and Claude itself rewrite it often); undefined while it
+  // cannot be read (missing, half written), which is no switch.
+  let accountStamp: string | null = null
+  let fileAccount: string | null | undefined
+  const accountNow = async (): Promise<string | null | undefined> => {
+    try {
+      const st = await $.fs.stat(accountPath)
+      const stamp = `${st.mtimeMs} ${st.size}`
+      if (stamp === accountStamp) return fileAccount
+      const cfg = JSON.parse(await $.fs.read(accountPath)) as Record<string, unknown>
+      const acc = isObj(cfg.oauthAccount) ? cfg.oauthAccount : {}
+      fileAccount = typeof acc.accountUuid === 'string' ? acc.accountUuid : null
+      accountStamp = stamp
+      return fileAccount
+    } catch {
+      return undefined
     }
   }
 
@@ -371,6 +400,10 @@ export async function boxStart($: EngineInterface, box: Box): Promise<void> {
     } catch {
       // stat failed: keep the interval
     }
+    // Another account than the last value's (a /login, an account switcher, a
+    // restart after one): its figures at once, without the start offset.
+    const account = await accountNow()
+    if (account !== undefined && measuredFor !== undefined && account !== measuredFor) nextMeasureAt = 0
     const startedAt = await $.clock.now()
     if (startedAt < nextMeasureAt) return
     await publish(isoOf(startedAt))

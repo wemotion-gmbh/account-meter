@@ -102,7 +102,12 @@ not run. Every `ACCOUNT_METER_INTERVAL_S` seconds
 (60..3600, default 300; after a start with a random 0..60 s offset) a short-lived child
 `claude -p --input-format stream-json ... --setting-sources ''` answers the SDK control request
 `get_usage` (no model request; the debug log is checked for `/v1/messages`). A new login, refresh or
-logout (`stat` on `.credentials.json` every 10 s) is measured at once; errors back off up to 30 min.
+logout (`stat` on `.credentials.json` every 10 s) is measured at once, and so is a switch to another
+account: every 10 s `oauthAccount.accountUuid` in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json`
+where that is set; read only when its `stat` changed) is compared with the account of the last value,
+also right after a start, which then skips the start offset. A file that is half written or missing
+for a moment is no switch, and the measuring child rewriting it is none either. Errors back off up to
+30 min.
 `usage.json` is written atomically and read by the box agent. `/clear` and `/resume` keep the meter
 running.
 

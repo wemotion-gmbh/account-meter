@@ -161,17 +161,24 @@ function world(on: On, o: { creds?: boolean; stdout?: string; exit?: number; fai
     creds: o.creds ?? true,
     credStamp: '1000 523',
     refreshOnRun: false,
+    // The child rewrites ~/.claude.json (as Claude does), the account unchanged.
+    rewriteOnRun: false,
     duringRun: [] as (string | undefined)[], // usage.json as the child sees it
+    mtimes: new Map<string, number>(),
   }
-  w.files.set('/home/claude/.claude.json', JSON.stringify({ oauthAccount: { accountUuid: 'uuid-1', emailAddress: 'a@example.test' } }))
+  login(w, 'uuid-1', 'a@example.test')
   on('session.start', () => ({ cwd: '/' }) as never)
   const env: Record<string, string> = { HOME: '/home/claude', CLAUDE_CODE_EXECPATH: '/opt/claude', ACCOUNT_METER_JITTER_MS: o.jitter ?? '0' }
   if (o.interval) env.ACCOUNT_METER_INTERVAL_S = o.interval
   on('env.get', (_$, e) => ({ value: env[e.name] }) as never)
   on('session.version', () => ({ value: { version: '2.1.301' } }) as never)
   // The plugin under test runs from its checkout; resolved, it is the box folder.
+  // A file of the world has its own stat.
   on('fs.stat', (_$, e) => {
     if (o.elsewhere) throw new Error(`ENOENT ${e.path}`)
+    const text = w.files.get(e.path)
+    if (text !== undefined) return { value: { kind: 'file', size: text.length, mtimeMs: w.mtimes.get(e.path) ?? 1, isLink: false } } as never
+    if (e.path === ACCOUNT_PATH) throw new Error(`ENOENT ${e.path}`)
     return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: true, realPath: BOX_ROOT } } as never
   })
   on('command.register', () => ({ value: { command: 'account-meter' } }) as never)
@@ -203,6 +210,7 @@ function world(on: On, o: { creds?: boolean; stdout?: string; exit?: number; fai
       w.duringRun.push(w.files.get('/home/claude/.claude-box/usage.json'))
       if (w.fail) throw new Error('timed out')
       if (w.refreshOnRun) w.credStamp = `${Number.parseInt(w.credStamp, 10) + 1} 523`
+      if (w.rewriteOnRun) write(w, ACCOUNT_PATH, (w.files.get(ACCOUNT_PATH) ?? '{}').replace(/\}$/, ',"numStartups":7}'))
       return { value: { exitCode: w.exit, stdout: w.stdout, stderr: '' } } as never
     }
     return { value: { exitCode: 0, stdout: '', stderr: '' } } as never
@@ -219,6 +227,17 @@ function world(on: On, o: { creds?: boolean; stdout?: string; exit?: number; fai
 }
 
 const USAGE_PATH = '/home/claude/.claude-box/usage.json'
+const ACCOUNT_PATH = '/home/claude/.claude.json'
+
+type World = { files: Map<string, string>; mtimes: Map<string, number> }
+function write(w: World, path: string, text: string) {
+  w.files.set(path, text)
+  w.mtimes.set(path, (w.mtimes.get(path) ?? 1) + 1)
+}
+// ~/.claude.json signed in as `uuid` (a /login, an account switcher).
+function login(w: World, uuid: string, email: string) {
+  write(w, ACCOUNT_PATH, JSON.stringify({ oauthAccount: { accountUuid: uuid, emailAddress: email } }))
+}
 const usageOf = (w: ReturnType<typeof world>) => JSON.parse(w.files.get(USAGE_PATH) ?? 'null') as Usage
 
 async function start($: Parameters<Parameters<typeof test>[1]>[0]) {
@@ -486,6 +505,58 @@ describe('plugin', () => {
     const r = await $.command.run({ command: 'account-meter', args: 'status' } as never)
     expect(r.text).toMatch(/box mode/)
     expect(r.text).toMatch(/2026-10-16T10:25:10Z, 5h 74% 7d 54% \(a@example\.test\)/)
+  })
+
+  test('a switch to another account is measured within 10 s, not at the next interval', async ($, on) => {
+    const w = world(on)
+    const clock = mock.clock(on, { now: 0 })
+    await start($)
+    await clock.advance(10_000)
+    expect(childRuns(w)).toBe(1)
+    expect(usageOf(w).account_uuid).toBe('uuid-1')
+    w.stdout = NO_RESET // the new account's answer, newer as_of
+    login(w, 'uuid-2', 'b@example.test') // the credentials file keeps its stamp
+    await clock.advance(10_000)
+    expect(childRuns(w)).toBe(2)
+    expect(usageOf(w).account_uuid).toBe('uuid-2')
+    expect(usageOf(w).email).toBe('b@example.test')
+    await clock.advance(60_000)
+    expect(childRuns(w)).toBe(2) // then the interval again
+  })
+
+  test('a restart on another account than usage.json names measures at the first check, without the offset', async ($, on) => {
+    const w = world(on, { jitter: '3600000' })
+    w.files.set(USAGE_PATH, JSON.stringify({ schema: 1, state: 'ok', measured_at: '2026-10-16T10:00:00Z', account_uuid: 'uuid-0' }))
+    const clock = mock.clock(on, { now: 0 })
+    await start($)
+    await clock.advance(10_000)
+    expect(childRuns(w)).toBe(1)
+    expect(usageOf(w).account_uuid).toBe('uuid-1')
+  })
+
+  test("the measuring child rewriting ~/.claude.json does not trigger another run", async ($, on) => {
+    const w = world(on)
+    w.rewriteOnRun = true
+    const clock = mock.clock(on, { now: 0 })
+    await start($)
+    await clock.advance(10_000)
+    expect(childRuns(w)).toBe(1)
+    await clock.advance(40_000)
+    expect(childRuns(w)).toBe(1)
+  })
+
+  test('~/.claude.json half written or gone for a moment is no switch', async ($, on) => {
+    const w = world(on)
+    const clock = mock.clock(on, { now: 0 })
+    await start($)
+    await clock.advance(10_000)
+    write(w, ACCOUNT_PATH, '{"oauthAccount":{"accountUu')
+    await clock.advance(10_000)
+    w.files.delete(ACCOUNT_PATH)
+    await clock.advance(10_000)
+    login(w, 'uuid-1', 'a@example.test')
+    await clock.advance(10_000)
+    expect(childRuns(w)).toBe(1)
   })
 
   test('outside the box folder the box meter never starts', LONG, async ($, on) => {
